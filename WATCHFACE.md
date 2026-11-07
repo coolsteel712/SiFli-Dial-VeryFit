@@ -3,6 +3,18 @@
 Reverse-engineering notes on the `.watch` watch-face container used by IDO / VeryFit watches built on SiFli
 (思澈) SoCs, and on the image resources inside it.
 
+> **Status: work in progress.** Everything here was checked against four real files
+> (`wf_w62.watch`, 9 files; `wf_f82.watch`, 50 files; `wf_w124.watch`, 25 files; `wf_w98.watch`, 51 files) plus vendor source files. Each claim is tagged:
+>
+> | Tag | Meaning |
+> |---|---|
+> | **VERIFIED** | Checked in code against the sample files (checksums matched, round trip identical, or output rendered correctly). |
+> | **SOURCE** | Taken from vendor source (`ido_app_custom_dial_make.c`, the OpenEZIP tool, `bf0_hal_ezip.c`), consistent with the samples. |
+> | **OBSERVED** | Seen in the samples, but meaning or generality not established. |
+> | **UNKNOWN** | Not determined. Do not guess. |
+
+Reference implementation: [`extract_sifli_dial.py`](extract_sifli_dial.py) — unpack, repack and decode.
+
 ---
 
 ## 1. Overview
@@ -19,7 +31,7 @@ A `.watch` file is a flat archive of the files a watch needs to install one watc
 
 `<name>` is e.g. `wf_w62` or `wf_f82`. Every file is stored under its absolute **device path**. **VERIFIED** on both samples.
 
-Pipeline context (**SOURCE**, from the IDO Watch Face designer): the designer exports a project zip containing
+Pipeline context (**SOURCE**, from the designer's JavaScript): the designer exports a project zip containing
 `iwf.json`, `font.json` and source images; the C source for the face is generated server-side from `iwf.json`; the
 images are converted to the ezip format and the face is compiled to ELF inside the SiFli SCons build. A pure-Python
 tool can therefore read and repack `.watch` files, but cannot produce the compiled `.so` modules.
@@ -153,8 +165,10 @@ Hex dump of `wf_w62.dsc`:
 - Entry = 1-byte type, 1-byte length (string length + 1, includes the NUL), then the string. **VERIFIED** (parses both samples).
 - Types seen: `0x06` and `0x0A` carry the face name (meaning of each **UNKNOWN**), `0x08` the face module, `0x09` the
   thumbnail, `0x07` the resource module. The role names are inferred from the strings; the code values are **OBSERVED**.
-- After the entries: `00 00`, then a 4-byte value (`30 f7 e4 6a` / `c6 62 de 24`). Algorithm **UNKNOWN**; it is not plain
-  CRC-32 of the preceding bytes.
+- After the entries: `00 00`, then a 4-byte value (`30 f7 e4 6a` / `c6 62 de 24` / `2d 1b 7f 7f` on `wf_w62` / `wf_f82` /
+  `wf_w98`). **VERIFIED** (3 faces): it is the CRC-32 described in §5.1 over all preceding bytes of the file.
+- The `.dsc` is therefore fully specified: all five strings follow from the face name. Why types `0x06` and `0x0A` both
+  carry the face name is still **UNKNOWN**.
 
 ---
 
@@ -171,8 +185,43 @@ Hex dump of `wf_w62.dsc`:
 
 The face module imports LVGL (v7-style) functions such as `lv_img_create` and `lv_img_set_angle`, and its source is
 generated from the designer's layout (**SOURCE**: the generated `wf_sifliTest.c`; clock-hand angles use tenths of a degree,
-with the hand rotated about a per-hand pivot). Each `.so` file ends in a 4-byte value (e.g. `6e 3c 8f 8f` on `wf_w62.so`) whose meaning is **UNKNOWN**
-(it is not plain CRC-32 of the preceding bytes).
+with the hand rotated about a per-hand pivot).
+
+### 5.1 Trailing CRC-32 — VERIFIED
+
+Every `.so`, `_res.so` and `.dsc` ends in a 4-byte little-endian value. It is a **CRC-32 with polynomial `0x04C11DB7`,
+initial value `0xFFFFFFFF`, no bit reflection and no final XOR** (CRC-32/MPEG-2) over all bytes of the file except these
+last 4. Verified on all six files of `wf_f82` and `wf_w98` (`.dsc`, `.so`, `_res.so`), and on `wf_w62`'s `.dsc` from its recorded bytes.
+```python
+def crc32_mpeg2(data, c=0xFFFFFFFF):
+    for b in data:
+        c ^= b << 24
+        for _ in range(8):
+            c = ((c << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if c & 0x80000000 else (c << 1) & 0xFFFFFFFF
+    return c
+```
+It was found because the two `_res.so` files differ only in the face name and this trailer, which makes the XOR of the
+two trailers equal the CRC of the XOR of the files for any CRC.
+
+### 5.2 `<name>_res.so` is the language pack — OBSERVED
+
+`wf_f82_res.so` and `wf_w98_res.so` are the same 2472 bytes except for the 3 bytes of the face name (offset 1344) and the CRC.
+They export tables such as `en_us_lang`, `zh_cn_lang`, `de_DE_lang`, `lv_i18n_lang_pack` plus `*_lang_translation`, i.e.
+the compiled `resource/lang/multi_language_table.xlsx`. It does **not** hold image data. How the `.xlsx` becomes
+this ELF is **UNKNOWN**.
+
+### 5.3 `<name>.so` structure — OBSERVED (wf_f82, wf_w98)
+
+- RT-Thread-style dynamic module. Exports: `module_init`, `module_cleanup`, `wf_<name>_register` (+ `_stack`).
+- Imports firmware symbols (resolved on the watch), e.g. `lv_img_create`, `lv_img_set_src`, `lv_img_set_angle`,
+  `lv_img_set_pivot`, `lv_task_create`, `dlmodule_*`, `app_clock_register`, `service_get_current_time`, `rt_malloc`;
+  the set varies with the widgets used (`wf_f82`: weather/temperature; `wf_w98`: battery percentage, 3-circle activity data).
+- Sections `.text` (Thumb code, 0xd2c bytes in `wf_f82`), `.rodata`, `.data.rel.ro`, `.dynamic`, `.got`, `.data`, `.bss`.
+- Image references are absolute device paths in `.rodata`, e.g. `/dynamic_app/watchface/wf_f82/ezip/wf_f82_picture_dialBg_0.bin`.
+- `.comment`: `GCC: (GNU MCU Eclipse ARM Embedded GCC, 64-bit) 8.2.1 20181213`; target Armv8-M mainline (`Tag_CPU_arch`
+  v8-M.mainline), FPv5-D16, hard-float, Thumb, "Aggressive Size" optimisation.
+- The `.c` that produces it includes firmware headers (`app_module.h`, `lvgl.h`, `service_comm.h`, `rtdef.h`,
+  `app_clock_comm.h`, `mod_installer.h`, `app_activity_info.h`, `app_unit.h`, `app_dial_data.h`); none are available.
 
 ---
 
@@ -276,6 +325,16 @@ Each row is preceded by a filter-type byte (0 None, 1 Sub, 2 Up, 3 Average, 4 Pa
 | 1 | 16 | 2 | RGB565, little-endian |
 | 2 | 24 | 3 | RGB565 little-endian, then alpha byte (straight alpha) |
 
+Newer variants seen on `wf_w124` (all `format` 1, `depth` 8 in the header, same shared-Huffman stream and filters,
+**VERIFIED**: Adler-32 matches on all 22 images, colours checked against the thumbnail):
+
+| `ctrl` (byte 8) | Bytes/pixel | Pixel |
+|---|---|---|
+| `0x42` | 3 | **B, G, R** (thumbnail, background) |
+| `0x46` | 4 | **B, G, R, A** (clock digits; checked on white glyphs only) |
+
+`depth == 8` in byte 9 therefore does not identify a palette image; use `ctrl == 0x43`.
+
 ### 6.4 Multi-frame container (`format` 0x1F) — VERIFIED on `wf_w62` only
 
 | File offset | Size | Endian | Field |
@@ -294,27 +353,45 @@ Each row is preceded by a filter-type byte (0 None, 1 Sub, 2 Up, 3 Average, 4 Pa
 
 `<name>_tn.bin` is a normal single ezip frame (`wf_w62`: 136×252, `wf_f82`: 270×270). **VERIFIED**.
 
-### 6.6 8-bit palette variant (`ctrl` 0x43) — PARTLY UNDERSTOOD, not decodable yet
+### 6.6 8-bit palette variant (`ctrl` 0x43) — index map decodable, colours UNRESOLVED
 
-On `wf_f82`, 24 of 47 images (clock digits, weekday labels, some date/temperature digits) use `format` 1 with `depth` 8 and
-`ctrl` 0x43.
+On `wf_f82`, 24 of 47 images (clock digits, weekday labels, some date/temperature digits) use `ctrl` 0x43.
 
-- Byte 17 holds a count (e.g. 0x43 = 67 for `wf_f82_date_1_dialDate_10.bin`, 10×20), and the file has a table of
-  4-byte entries beginning at file offset 24.
-- On that one file, shared-Huffman data starts at `24 + 4·(count + 1)` = 296 and decodes to exactly `10×20 + 20` bytes with
-  a matching Adler-32. **VERIFIED for this file only.** The same rule fails on larger files (e.g. `wf_f82_time_0_dialClock_0.bin`).
-- After unfiltering (1 byte/pixel), the index map is clearly an image (a diagonal glyph), with indices numbered in
-  first-appearance order. So the stream is a palette-index image.
-- **UNKNOWN:** how the 4-byte table entries map to color and alpha (tried RGBA, ARGB, BGRA and RGB-opaque byte orders; none
-  gives a clean image), and how the data offset is derived on larger files.
+- **VERIFIED** (24/24 on `wf_f82`, Adler-32 OK; also `wf_w98` has none): byte 17 = entry count − 1. The colour table has
+  4 bytes per entry, starting at file offset 24. The shared-Huffman stream starts at
+  `24 + 4·count + 4·(blocks − 1)` where `blocks = ceil(h / f[10])`. The one extra word per additional block looks like the
+  next block's offset. The decoded stream is `h·(w+1)` bytes: a filtered 1-byte-per-pixel index map.
+- The index map is clearly an image (glyphs "1", "7", "TUE" are recognisable). Indices are numbered in first-appearance order.
+- Table bytes are in **B, G, R, x** order: opaque glyph pixels give (37,59,81) vs (32,60,82) in an RGB565 sibling.
+- Entries such as `80 80 80 02`, `55 55 55 03`, `40 40 40 04` obey colour × x ≈ 256, i.e. an un-premultiplied value of 1,
+  so `x` may be real alpha.
+- **UNRESOLVED:** applying entry *i* to index *i* gives a background that is about 56 % opaque and a glyph interior that is
+  about 13 % opaque, which contradicts the thumbnail (navy digits, transparent background). Table order, the unused last
+  entry and the alpha rule are **UNKNOWN**. Tried: raster, column, reversed, serpentine and tile first-appearance orders; a
+  smoothness search (degenerate). `extract_sifli_dial.py --palette` therefore writes the index map, the raw table and an
+  **UNVERIFIED** preview only.
+- What would settle it: a source PNG plus the `.bin` made from it by SiFli's GraphicsTool.
 
 ---
 
-## 7. Sources
+## 7. Open questions
+
+1. Meaning of `project_no` (13 in the first two samples) and of the header `reserve` bytes.
+2. The trailing 4 bytes of raw (`format` 5) images, and the 4–7 extra bytes after some ezip frames (probably padding to 4).
+3. Why `.dsc` types `0x06` and `0x0A` both hold the face name.
+4. Block-table entries (§6.3.1), the `rows` field (§6.3), and the unused bits of the resource header.
+5. The 8-bit palette variant: colour/alpha rule (§6.6).
+6. The standard raw-DEFLATE ezip stream and per-block raw DEFLATE stream (both in OpenEZIP; no sample available).
+7. Whether other devices use other `project_no` values or `format` codes.
+8. Building a valid `.watch` from scratch. Solved or cheap: container (§2), `.dsc` and all CRC trailers (§4, §5.1).
+   Still open: compiling the face `.so` (toolchain and firmware headers needed, §5.3), producing `_res.so` from the `.xlsx` (§5.2),
+   and an ezip encoder (block table, mode selection).
+
+## 8. Sources
 
 - `ido_app_custom_dial_make.c`: vendor packer for the container (`head_t`, `file_head_t`, CRC-16).
 - OpenEZIP (SiFli ezip decoder tool, `ezip_decoder.py` / `sifli_header.py`): ezip stream layouts and shared-Huffman decoder.
 - `bf0_hal_ezip.c`: SiFli EZIP hardware driver (decode modes EZIP / GZIP / LZ4, error flags); no bitstream.
 - Designer JS (`WatchService.js`, `ProtocolUtilSiChe.js`): export zip layout, image naming, `ezip` / `no_ezip` split.
 - `wf_sifliTest.c`: example generated LVGL face source (hand pivots and angle formulas).
-- Sample faces: `wf_w62.watch`, `wf_f82.watch`.
+- Sample faces: `wf_w62.watch`, `wf_f82.watch`, `wf_w124.watch`, `wf_w98.watch`; export projects `wf_sifliTest.zip` (two versions).
