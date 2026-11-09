@@ -7,6 +7,7 @@ Usage:
   extract_sifli_dial.py extract FACE.watch [-o OUTDIR]   unpack files AND decode images to PNG (default command)
   extract_sifli_dial.py unpack  FACE.watch [-o OUTDIR]   unpack files only
   extract_sifli_dial.py decode  INPUT [-o OUTDIR]        decode image .bin / folder of .bin / .watch to PNG
+  (extract/decode accept --palette: for 8-bit palette images, write raw index map + table + UNVERIFIED preview)
   extract_sifli_dial.py pack    OUTDIR FACE.watch        rebuild a .watch from an unpacked OUTDIR
 
 Output layout of extract/unpack:
@@ -20,14 +21,10 @@ VERIFIED on wf_w62.watch:
   * Image .bin, cf 5: raw RGB565+A8 pointer image.
   * Image .bin, cf 1/2: a single ezip frame (also used by thumbnails); cf 31: multi-frame container; each frame uses the shared-Huffman "legacy" ezip layout
     (layout taken from the OpenEZIP tool); every decoded frame's Adler-32 matched.
+  * ctrl 0x42 (BGR888) and 0x46 (BGRA8888) verified on wf_w124 (Adler-32 OK; colours checked visually).
 NOT handled: 8-bit palette-indexed ezip (ctrl 0x43, seen on wf_f82: layout partly understood, colors
 unresolved), the standard raw-DEFLATE ezip variant, and per-block raw DEFLATE (ported
 from OpenEZIP but UNTESTED, no sample available). Other faces/devices are untested.
-
-TESTED DEVICES:
-DR03: Passed
-BF300P: Passed
-GTX26: Passed
 """
 import argparse
 import json
@@ -288,13 +285,71 @@ def rgb565_image(px, w, h, alpha):
     return im
 
 
-def decode_frame(f):
-    """Decode one ezip frame (4-byte resource header + stream). Verifies the Adler-32 trailer."""
+def bgr_image(px, w, h, alpha):
+    """Raw 24-bit (ctrl 0x42, B,G,R) or 32-bit (ctrl 0x46, B,G,R,A) pixels. Byte order VERIFIED on wf_w124
+    (BGR gives the correct colours of its thumbnail; RGB does not)."""
+    Image = _pillow()
+    n = 4 if alpha else 3
+    im = Image.new('RGBA', (w, h))
+    im.putdata([(px[n * i + 2], px[n * i + 1], px[n * i], px[n * i + 3] if alpha else 255)
+                for i in range(w * h)])
+    return im
+
+
+class PaletteUnsupported(ValueError):
+    pass
+
+
+def decode_palette_frame(f):
+    """Decode an 8-bit palette ezip frame (ctrl 0x43) into (w, h, index_map, table).
+
+    VERIFIED (23/23 palette files of wf_f82, Adler-32 OK): header byte 17 = entry count - 1; the table is
+    4 bytes per entry from file offset 24 (B,G,R,x byte order - see below); the stream follows it,
+    after (blocks - 1) extra 4-byte words when the image is taller than the block height (blocks =
+    ceil(h / f[10])); stream = filtered 1-byte indices, same shared-Huffman coder.
+    UNKNOWN / UNRESOLVED: how a table entry becomes a final pixel. The 4th byte does not behave like
+    plain alpha when entry i is applied to index i (see SIFLI_DIAL.md), and the last table entry
+    (never referenced by any pixel) is some other field. Colours returned here are the raw table."""
     _, w, h = header(f)
-    if f[9] == 8:  # stream bit depth 8 (ctrl 0x43): palette-indexed variant
-        raise ValueError('8-bit palette variant (ctrl 0x%02x) not supported yet' % f[8])
     size = struct.unpack_from('>I', f, 4)[0]
+    rows = f[10]
+    cnt = f[17] + 1
+    nblk = -(-h // rows)
+    start = 24 + 4 * cnt + 4 * (nblk - 1)
+    lz = decode_shared_huffman(f[start:4 + size - 4])
+    if zlib.adler32(bytes(lz)) & 0xFFFFFFFF != struct.unpack_from('>I', f, 4 + size - 4)[0]:
+        raise ValueError('Adler-32 mismatch (palette stream)')
+    idx = unfilter(lz, w, h, 1, rows)
+    table = [bytes(f[24 + 4 * i:28 + 4 * i]) for i in range(cnt)]
+    return w, h, idx, table
+
+
+def palette_outputs(f, stem, outdir):
+    """Write <stem>.indexmap.png (grey = index), <stem>.palette.json (raw table) and
+    <stem>.UNVERIFIED.png (table applied as B,G,R,A to index i - colours/alpha NOT verified)."""
+    Image = _pillow()
+    w, h, idx, table = decode_palette_frame(f)
+    im = Image.new('L', (w, h))
+    im.putdata([min(v, 255) for v in idx])
+    im.save(os.path.join(outdir, stem + '.indexmap.png'))
+    with open(os.path.join(outdir, stem + '.palette.json'), 'w') as fh:
+        json.dump(dict(width=w, height=h, entries_bgra=[e.hex() for e in table],
+                       note='raw table; last entry is not referenced by any pixel; colour/alpha rule UNKNOWN'),
+                  fh, indent=1)
+    pv = Image.new('RGBA', (w, h))
+    pv.putdata([(table[v][2], table[v][1], table[v][0], table[v][3]) for v in idx])
+    pv.save(os.path.join(outdir, stem + '.UNVERIFIED.png'))
+
+
+def decode_frame(f):
+    """Decode one ezip frame (4-byte resource header + stream). Verifies the Adler-32 trailer.
+    ctrl 0x4c = RGB565+A8, 0x48 = RGB565, 0x42 = BGR888, 0x46 = BGRA8888 (all shared-Huffman, filtered);
+    0x43 = 8-bit palette: NOT supported (colour/alpha rule of the palette table is unresolved)."""
+    _, w, h = header(f)
     ctrl = f[8]
+    if ctrl == 0x43:
+        raise PaletteUnsupported('8-bit palette (ctrl 0x43): colours UNRESOLVED; use --palette for raw index map + table')
+    size = struct.unpack_from('>I', f, 4)[0]
     filters = (f[16] & 15) != 1
     comp = f[20:]
     rows, nblk = struct.unpack_from('>HH', comp, 0)
@@ -313,9 +368,15 @@ def decode_frame(f):
     if zlib.adler32(bytes(lz)) & 0xFFFFFFFF != want:
         raise ValueError('Adler-32 mismatch')
     bpp = (len(lz) - (h if filters else 0)) // (w * h)
-    if bpp not in (2, 3):
+    if bpp not in (2, 3, 4):
         raise ValueError('unsupported bytes/pixel %d' % bpp)
     px = unfilter(lz, w, h, bpp, rows) if filters else lz
+    if ctrl == 0x42 and bpp == 3:
+        return bgr_image(px, w, h, False)
+    if ctrl == 0x46 and bpp == 4:
+        return bgr_image(px, w, h, True)
+    if bpp == 4:
+        raise ValueError('32-bit data with unexpected ctrl 0x%02x' % ctrl)
     return rgb565_image(px, w, h, bpp == 3)
 
 
@@ -359,7 +420,7 @@ def iter_images(path):
         yield os.path.basename(path), d
 
 
-def decode_all(path, outdir):
+def decode_all(path, outdir, palette=False):
     os.makedirs(outdir, exist_ok=True)
     ok = bad = 0
     for name, data in iter_images(path):
@@ -370,6 +431,17 @@ def decode_all(path, outdir):
                 im.save(os.path.join(outdir, stem + ('_f%d' % i if len(frames) > 1 else '') + '.png'))
             print('  %-40s OK    %d frame(s) %dx%d' % (name, len(frames), *frames[0].size))
             ok += 1
+        except PaletteUnsupported as e:
+            if palette and data[8] == 0x43 and header(data)[0] in (1, 2):
+                try:
+                    palette_outputs(data, os.path.splitext(name)[0], outdir)
+                    print('  %-40s PALETTE index map + raw table + UNVERIFIED preview' % name)
+                    ok += 1
+                    continue
+                except Exception as e2:
+                    e = e2
+            print('  %-40s SKIP  %s' % (name, e))
+            bad += 1
         except Exception as e:  # report and keep going
             print('  %-40s SKIP  %s' % (name, e))
             bad += 1
@@ -387,6 +459,9 @@ def main():
         p = sub.add_parser(name)
         p.add_argument('input')
         p.add_argument('-o', '--outdir')
+        if name != 'unpack':
+            p.add_argument('--palette', action='store_true',
+                           help='for 8-bit palette images write index map, raw table and an UNVERIFIED preview')
     p = sub.add_parser('pack')
     p.add_argument('srcdir')
     p.add_argument('output')
@@ -402,7 +477,7 @@ def main():
     if args.cmd in ('extract', 'unpack'):
         print('unpacked %d files -> %s' % (unpack(args.input, out), os.path.join(out, 'raw')))
     if args.cmd in ('extract', 'decode'):
-        decode_all(args.input, os.path.join(out, 'png'))
+        decode_all(args.input, os.path.join(out, 'png'), args.palette)
     return 0
 
 
